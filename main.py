@@ -67,79 +67,113 @@ MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000000"))
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2.0"))
 CACHE_DB = "moex_cache.db"
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "1"))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "20"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "10"))
 
-# ---------- MOEX API ----------
+# ---------- MOEX API (ИСПРАВЛЕНО) ----------
 class MoexAPI:
     BASE = 'https://iss.moex.com/iss'
     
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self._lock = asyncio.Lock()
     
     async def get_session(self) -> aiohttp.ClientSession:
-        if not self.session or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=60)
-            connector = aiohttp.TCPConnector(force_close=True)
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/json'
-                }
-            )
-        return self.session
+        async with self._lock:
+            if self.session is None or self.session.closed:
+                timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                connector = aiohttp.TCPConnector(
+                    limit=50,
+                    limit_per_host=10,
+                    ttl_dns_cache=300,
+                    force_close=True,
+                    enable_cleanup_closed=True
+                )
+                self.session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'application/json'
+                    }
+                )
+            return self.session
     
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        async with self._lock:
+            if self.session and not self.session.closed:
+                await self.session.close()
+                self.session = None
     
-    async def request(self, url: str) -> Optional[dict]:
-        s = await self.get_session()
-        try:
-            async with s.get(url) as r:
-                if r.status == 200:
-                    return await r.json()
-                else:
-                    logger.warning(f"HTTP {r.status} для {url[:100]}")
-        except asyncio.TimeoutError:
-            logger.error(f"⏰ Таймаут запроса: {url[:100]}")
-        except Exception as e:
-            logger.error(f"Ошибка запроса: {e}")
+    async def request(self, url: str, retries: int = 3) -> Optional[dict]:
+        """Запрос с повторными попытками"""
+        for attempt in range(retries):
+            try:
+                s = await self.get_session()
+                async with s.get(url, ssl=False) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    elif r.status == 429:
+                        wait_time = 2 ** attempt
+                        logger.warning(f"⏳ Rate limit, ждем {wait_time}с...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.warning(f"HTTP {r.status} для {url[:100]}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(1)
+                            continue
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ Таймаут запроса (попытка {attempt+1}/{retries})")
+                if attempt < retries - 1:
+                    await asyncio.sleep(1)
+            except aiohttp.ClientError as e:
+                logger.error(f"🌐 Сетевая ошибка (попытка {attempt+1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"❌ Ошибка запроса: {e}")
+                break
         return None
     
     async def get_all_tickers(self) -> Optional[pd.DataFrame]:
         logger.info("📋 Загружаем список акций...")
         
         sec_url = f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities.json?iss.meta=off"
-        sec_data = await self.request(sec_url)
+        mkt_url = f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities.json?iss.only=marketdata&iss.meta=off"
+        
+        sec_data, mkt_data = await asyncio.gather(
+            self.request(sec_url),
+            self.request(mkt_url)
+        )
         
         if not sec_data or 'securities' not in sec_data:
             logger.error("❌ Не удалось получить список бумаг")
             return None
         
-        mkt_url = f"{self.BASE}/engines/stock/markets/shares/boards/TQBR/securities.json?iss.only=marketdata&iss.meta=off"
-        mkt_data = await self.request(mkt_url)
-        
         if not mkt_data or 'marketdata' not in mkt_data:
             logger.error("❌ Не удалось получить рыночные данные")
             return None
         
-        sec_cols = sec_data['securities']['columns']
-        sec_rows = sec_data['securities']['data']
-        df_sec = pd.DataFrame(sec_rows, columns=sec_cols)
-        
-        mkt_cols = mkt_data['marketdata']['columns']
-        mkt_rows = mkt_data['marketdata']['data']
-        df_mkt = pd.DataFrame(mkt_rows, columns=mkt_cols)
-        
-        df = df_sec[['SECID', 'SHORTNAME']].merge(
-            df_mkt[['SECID', 'LAST', 'VALTODAY']], on='SECID', how='left'
-        )
-        df = df.rename(columns={'VALTODAY': 'VOLUME_RUB'})
-        
-        logger.info(f"✅ Загружено {len(df)} акций")
-        return df
+        try:
+            sec_cols = sec_data['securities']['columns']
+            sec_rows = sec_data['securities']['data']
+            df_sec = pd.DataFrame(sec_rows, columns=sec_cols)
+            
+            mkt_cols = mkt_data['marketdata']['columns']
+            mkt_rows = mkt_data['marketdata']['data']
+            df_mkt = pd.DataFrame(mkt_rows, columns=mkt_cols)
+            
+            df = df_sec[['SECID', 'SHORTNAME']].merge(
+                df_mkt[['SECID', 'LAST', 'VALTODAY']], on='SECID', how='left'
+            )
+            df = df.rename(columns={'VALTODAY': 'VOLUME_RUB'})
+            
+            logger.info(f"✅ Загружено {len(df)} акций")
+            return df
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки данных: {e}")
+            return None
     
     async def get_history(self, ticker: str, days_back: int = 30) -> Optional[pd.DataFrame]:
         till = datetime.now()
@@ -266,20 +300,18 @@ def get_news_for_ticker(ticker: str, name: str) -> Optional[Tuple[str, str]]:
     
     return None
 
-# ---------- РАСЧЕТ СТОП-ЛОССА (ИСПРАВЛЕНО) ----------
+# ---------- РАСЧЕТ СТОП-ЛОССА ----------
 def calculate_stop_loss(current_price: float, stop_loss_percent: float) -> Dict:
     """
     Правильный расчет стоп-лосса для LONG позиции:
-    - Если вы покупаете на падении, стоп-лосс ставится НИЖЕ цены покупки
     - stop_loss_price = current_price * (1 - stop_loss_percent / 100)
+    - Риск на акцию = current_price - stop_loss_price
+    - Тейк-профит = current_price * (1 + (stop_loss_percent * 2) / 100)  (R/R = 1:2)
     
-    Пример: цена акции 100₽, стоп-лосс 2%
-    Стоп-лосс цена = 100 * (1 - 0.02) = 100 * 0.98 = 98₽
-    Риск на акцию = 100 - 98 = 2₽
-    
-    Дополнительно рассчитывается:
-    - Тейк-профит (соотношение риск/прибыль 1:2)
-    - Процент риска
+    Пример: цена 100₽, SL 2%
+    SL цена = 100 * 0.98 = 98₽
+    Риск = 2₽
+    TP = 100 * 1.04 = 104₽
     """
     if current_price <= 0 or stop_loss_percent <= 0:
         return {
@@ -288,26 +320,14 @@ def calculate_stop_loss(current_price: float, stop_loss_percent: float) -> Dict:
             'stop_loss_price': 0,
             'stop_loss_amount': 0,
             'risk_per_share': 0,
-            'risk_per_lot': 0,
             'take_profit_price': 0,
             'potential_profit_per_share': 0,
             'risk_reward_ratio': 'N/A'
         }
     
-    # Расчет стоп-лосса (ниже текущей цены)
     sl_price = round(current_price * (1 - stop_loss_percent / 100), 2)
-    
-    # Риск на одну акцию в рублях
     risk_per_share = round(current_price - sl_price, 2)
-    
-    # Расчет на лот (обычно 1 лот = 1 акция для российского рынка, но может быть разным)
-    lot_size = 1  # Для MOEX стандартный лот обычно 1 акция
-    risk_per_lot = round(risk_per_share * lot_size, 2)
-    
-    # Тейк-профит (соотношение риск/прибыль 1:2)
     take_profit_price = round(current_price * (1 + (stop_loss_percent * 2) / 100), 2)
-    
-    # Потенциальная прибыль на акцию
     potential_profit_per_share = round(take_profit_price - current_price, 2)
     
     return {
@@ -316,20 +336,17 @@ def calculate_stop_loss(current_price: float, stop_loss_percent: float) -> Dict:
         'stop_loss_price': sl_price,
         'stop_loss_amount': risk_per_share,
         'risk_per_share': risk_per_share,
-        'risk_per_lot': risk_per_lot,
         'take_profit_price': take_profit_price,
         'potential_profit_per_share': potential_profit_per_share,
         'risk_reward_ratio': f'1:{round(potential_profit_per_share/risk_per_share, 1) if risk_per_share > 0 else 0}'
     }
 
-# ---------- АНАЛИЗ (ИСПРАВЛЕНО) ----------
+# ---------- АНАЛИЗ ----------
 async def analyze_ticker(api: MoexAPI, ticker: str, name: str, volume: float) -> Optional[Dict]:
     try:
-        # 1. Получаем данные (из кэша или API)
         cached = await get_cached_prices(ticker)
         
         if cached:
-            # Преобразуем словарь в DataFrame
             records = []
             for date_str, close_val in cached.items():
                 try:
@@ -339,15 +356,12 @@ async def analyze_ticker(api: MoexAPI, ticker: str, name: str, volume: float) ->
                     continue
             
             if not records:
-                logger.debug(f"{ticker}: нет валидных записей в кэше")
                 return None
             df = pd.DataFrame(records)
         else:
-            # Запрашиваем с запасом +10 дней для надежности
             df = await api.get_history(ticker, days_back=DAYS_BACK + 10)
             
             if df is not None and not df.empty:
-                # Сохраняем в кэш
                 cache_data = {}
                 for _, row in df.iterrows():
                     try:
@@ -361,69 +375,47 @@ async def analyze_ticker(api: MoexAPI, ticker: str, name: str, volume: float) ->
                 if cache_data:
                     await set_cached_prices(ticker, cache_data)
         
-        # 2. Проверки данных
         if df is None or df.empty:
-            logger.debug(f"{ticker}: нет данных для анализа")
             return None
         
         df = df.sort_values('date').reset_index(drop=True)
         
         if len(df) < 2:
-            logger.debug(f"{ticker}: недостаточно данных (только {len(df)} точка)")
             return None
         
-        # 3. Последняя цена и дата
         latest = df.iloc[-1]
         latest_price = float(latest['close'])
         latest_date = latest['date']
         
-        # Приводим дату к date, если это datetime
         if hasattr(latest_date, 'date'):
             latest_date = latest_date.date()
         
         if latest_price <= 0:
-            logger.warning(f"{ticker}: некорректная последняя цена {latest_price}")
             return None
         
-        # 4. Целевая дата (DAYS_BACK календарных дней назад)
         target_date = latest_date - timedelta(days=DAYS_BACK)
-        
-        # 5. Ищем старую цену по дате, а не по индексу!
         old_candidates = df[df['date'] <= target_date].copy()
         
         if old_candidates.empty:
-            # Если нет данных за целевой период — берем самую старую доступную запись
             if len(df) >= 2:
-                # Берем самую первую запись
                 old_candidates = df.head(1)
-                logger.debug(
-                    f"{ticker}: нет данных за {target_date}, "
-                    f"использую самую старую: {old_candidates.iloc[0]['date']}"
-                )
             else:
                 return None
         
-        old = old_candidates.iloc[-1]  # Самая поздняя запись среди подходящих
+        old = old_candidates.iloc[-1]
         old_price = float(old['close'])
         old_date = old['date']
         
-        # Приводим дату к date
         if hasattr(old_date, 'date'):
             old_date = old_date.date()
         
         if old_price <= 0:
-            logger.warning(f"{ticker}: некорректная старая цена {old_price}")
             return None
         
-        # 6. Считаем процент изменения
         change_pct = ((latest_price - old_price) / old_price) * 100
         
-        # 7. Проверяем порог падения
         if change_pct <= -DROP_PERCENT:
-            # Получаем новости
             news_info = get_news_for_ticker(ticker, name)
-            
-            # Рассчитываем стоп-лосс
             stop_loss = calculate_stop_loss(latest_price, STOP_LOSS_PERCENT)
             
             result = {
@@ -446,18 +438,16 @@ async def analyze_ticker(api: MoexAPI, ticker: str, name: str, volume: float) ->
                 f"| SL: {stop_loss['stop_loss_price']}₽ | V: {volume:,.0f}₽"
             )
             return result
-        else:
-            logger.debug(f"{ticker}: падение {change_pct:+.2f}% (порог: -{DROP_PERCENT}%)")
     
     except Exception as e:
-        logger.error(f"🔥 Ошибка анализа {ticker}: {e}", exc_info=True)
+        logger.error(f"🔥 Ошибка анализа {ticker}: {e}")
     
     return None
 
 # ---------- СКАНИРОВАНИЕ ----------
 async def scan_market() -> List[Dict]:
     await init_cache()
-    logger.info(f"🔍 Сканирование: падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн., объем ≥{MIN_VOLUME/1e6:.0f} млн ₽, SL={STOP_LOSS_PERCENT}%")
+    logger.info(f"🔍 Сканирование: падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн., объем ≥{MIN_VOLUME/1e6:.0f} млн ₽")
     
     api = MoexAPI()
     
@@ -496,43 +486,13 @@ async def scan_market() -> List[Dict]:
     finally:
         await api.close()
 
-# ---------- ФОРМАТИРОВАНИЕ (ИСПРАВЛЕНО) ----------
+# ---------- ФОРМАТИРОВАНИЕ ----------
 def escape_html(text: str) -> str:
     if text is None:
         return ""
     return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def format_results(results: List[Dict]) -> str:
-    if not results:
-        return "😞 Акций с заданными критериями не найдено."
-    
-    msg = f"📊 <b>ПАДАЮЩИЕ АКЦИИ (≥{DROP_PERCENT}% за {DAYS_BACK} дн.)</b>\n"
-    msg += f"💰 Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽ | 🛑 SL: {STOP_LOSS_PERCENT}%\n"
-    msg += "=" * 30 + "\n"
-    
-    for r in results:
-        sl = r['stop_loss']
-        msg += f"\n🔻 <b>{r['ticker']}</b> ({escape_html(r['name'])})\n"
-        msg += f"   📉 Падение: <b>{r['change_pct']}%</b>\n"
-        msg += f"   💰 Цена входа: {r['price_to']}₽\n"
-        msg += f"   🛑 Стоп-лосс: <b>{sl['stop_loss_price']}₽</b> (-{STOP_LOSS_PERCENT}%)\n"
-        msg += f"   ⚠️ Риск на акцию: {sl['risk_per_share']}₽\n"
-        msg += f"   🎯 Тейк-профит: {sl['take_profit_price']}₽ (+{sl['potential_profit_per_share']}₽)\n"
-        msg += f"   📊 Риск/Прибыль: {sl['risk_reward_ratio']}\n"
-        msg += f"   📅 Период падения: {r['date_from']} → {r['date_to']}\n"
-        msg += f"   📊 Объем торгов: {r['volume_rub']:,.0f}₽\n"
-        
-        if r['news_title'] and r['news_url']:
-            msg += f"   📰 <a href='{r['news_url']}'>{escape_html(r['news_title'])}</a>\n"
-        elif r['news_title']:
-            msg += f"   📰 {escape_html(r['news_title'])}\n"
-    
-    msg += "\n" + "=" * 30
-    msg += f"\n🎯 Всего найдено: {len(results)}"
-    msg += f"\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    return msg
-
-# ---------- ОТПРАВКА В TELEGRAM (ИСПРАВЛЕНО) ----------
+# ---------- ОТПРАВКА В TELEGRAM ----------
 async def send_results_to_telegram(results: List[Dict], context: ContextTypes.DEFAULT_TYPE = None):
     """Отправка результатов в Telegram"""
     try:
@@ -540,8 +500,8 @@ async def send_results_to_telegram(results: List[Dict], context: ContextTypes.DE
         
         if not results:
             text = (
-                f"📉 <b>Ежедневный отчет о падающих акциях</b>\n\n"
-                f"😞 Акций с падением ≥{DROP_PERCENT}% за {DAYS_BACK} дн. не найдено.\n"
+                f"📉 <b>Отчет о падающих акциях</b>\n\n"
+                f"😞 Акций с падением ≥{DROP_PERCENT}% не найдено\n"
                 f"💰 Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽\n"
                 f"🛑 Стоп-лосс: {STOP_LOSS_PERCENT}%\n\n"
                 f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК"
@@ -553,18 +513,14 @@ async def send_results_to_telegram(results: List[Dict], context: ContextTypes.DE
             )
             return
         
-        # Отправляем заголовок
         header = (
-            f"📊 <b>ЕЖЕДНЕВНЫЙ ОТЧЕТ О ПАДАЮЩИХ АКЦИЯХ</b>\n"
-            f"📅 {datetime.now().strftime('%d.%m.%Y')}\n"
-            f"⏰ 17:30 МСК\n"
+            f"📊 <b>ПАДАЮЩИЕ АКЦИИ MOEX</b>\n"
             f"{'=' * 30}\n"
             f"Найдено: <b>{len(results)}</b> акций\n"
-            f"Критерии:\n"
-            f"• Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.\n"
-            f"• Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽\n"
-            f"• Стоп-лосс: <b>{STOP_LOSS_PERCENT}%</b>\n"
-            f"• Риск/Прибыль: 1:2\n"
+            f"Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.\n"
+            f"Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽\n"
+            f"Стоп-лосс: <b>{STOP_LOSS_PERCENT}%</b>\n"
+            f"Соотношение R/R: 1:2\n"
         )
         await bot.send_message(
             chat_id=TELEGRAM_USER_ID,
@@ -572,7 +528,6 @@ async def send_results_to_telegram(results: List[Dict], context: ContextTypes.DE
             parse_mode='HTML'
         )
         
-        # Отправляем каждый результат отдельно с кнопкой
         for i, r in enumerate(results, 1):
             sl = r['stop_loss']
             text = (
@@ -599,12 +554,7 @@ async def send_results_to_telegram(results: List[Dict], context: ContextTypes.DE
             )
             await asyncio.sleep(0.3)
         
-        # Итоговое сообщение
-        footer = (
-            f"\n✅ Отчет завершен\n"
-            f"🕒 {datetime.now().strftime('%H:%M:%S')} МСК\n"
-            f"💡 <i>Для пересчета укажите свой % стоп-лосса в .env файле</i>"
-        )
+        footer = f"✅ Отчет завершен\n🕒 {datetime.now().strftime('%H:%M:%S')} МСК"
         await bot.send_message(
             chat_id=TELEGRAM_USER_ID,
             text=footer,
@@ -615,36 +565,26 @@ async def send_results_to_telegram(results: List[Dict], context: ContextTypes.DE
         
     except TelegramError as e:
         logger.error(f"🔥 Ошибка Telegram: {e}")
-        if "chat not found" in str(e).lower():
-            logger.error("💡 Напишите боту /start в Telegram!")
 
 # ---------- КОМАНДЫ БОТА ----------
 async def start_cmd(update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
     text = (
         "🚀 <b>БОТ ПАДАЮЩИХ АКЦИЙ MOEX</b>\n\n"
-        f"🔍 Ищу акции с падением ≥{DROP_PERCENT}% за {DAYS_BACK} дня\n"
-        f"💰 Минимальный объем торгов: {MIN_VOLUME/1e6:.0f} млн ₽\n"
-        f"🛑 Автостоп-лосс: {STOP_LOSS_PERCENT}%\n"
-        f"📊 Соотношение риск/прибыль: 1:2\n\n"
-        "<b>📋 Команды:</b>\n"
-        "/scan — запустить сканирование сейчас\n"
-        "/status — статус и настройки\n"
-        "/help — подробная помощь\n\n"
-        "<b>🕐 Автоуведомления:</b>\n"
-        "• Ежедневно в <b>17:30 МСК</b>\n\n"
-        "<b>💡 Как использовать стоп-лосс:</b>\n"
-        f"• Цена стоп-лосса = Текущая цена × (1 - {STOP_LOSS_PERCENT}%)\n"
-        "• Например: цена 100₽, SL 2% → стоп на 98₽\n"
-        "• Риск на акцию = 2₽"
+        f"🔍 Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дня\n"
+        f"💰 Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽\n"
+        f"🛑 Стоп-лосс: {STOP_LOSS_PERCENT}%\n"
+        f"📊 R/R: 1:2\n\n"
+        "<b>Команды:</b>\n"
+        "/scan — сканирование сейчас\n"
+        "/status — статус\n"
+        "/help — помощь\n\n"
+        "🕐 Автоуведомления: <b>17:30 МСК</b>"
     )
     await update.message.reply_text(text, parse_mode='HTML')
 
 async def scan_cmd(update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /scan — ручное сканирование"""
     msg = await update.message.reply_text(
-        f"🔍 <b>Запускаю сканирование...</b>\n"
-        f"⏳ Пожалуйста, подождите (анализ может занять 1-2 минуты)",
+        "🔍 <b>Запускаю сканирование...</b>\n⏳ Подождите 1-2 минуты",
         parse_mode='HTML'
     )
     
@@ -657,8 +597,6 @@ async def scan_cmd(update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Ошибка: {escape_html(str(e)[:200])}")
 
 async def status_cmd(update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /status"""
-    # Следующий запуск в 17:30 МСК
     msk_tz = pytz.timezone('Europe/Moscow')
     now_msk = datetime.now(msk_tz)
     
@@ -673,61 +611,41 @@ async def status_cmd(update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📊 <b>СТАТУС БОТА</b>\n\n"
         f"✅ Бот активен\n"
-        f"📅 Следующее автосканирование: <b>сегодня в 17:30 МСК</b>\n"
+        f"📅 Следующее сканирование: <b>сегодня в 17:30 МСК</b>\n"
         f"⏳ Через: {hours} ч. {minutes} мин.\n\n"
-        "<b>Текущие настройки:</b>\n"
+        "<b>Настройки:</b>\n"
         f"• Падение: ≥{DROP_PERCENT}%\n"
         f"• Период: {DAYS_BACK} дня\n"
         f"• Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽\n"
         f"• Стоп-лосс: {STOP_LOSS_PERCENT}%\n"
-        f"• Соотношение R/R: 1:2\n"
-        f"• Автоуведомления: 17:30 МСК\n\n"
-        "<b>Формула стоп-лосса:</b>\n"
-        f"SL = Цена × (1 - {STOP_LOSS_PERCENT}/100)\n\n"
-        "<b>Команды:</b> /scan /start /help"
+        f"• R/R: 1:2\n\n"
+        "<b>Формула SL:</b>\n"
+        f"SL = Цена × (1 - {STOP_LOSS_PERCENT}/100)\n"
+        "Пример: 100₽ - 2% = 98₽"
     )
     await update.message.reply_text(text, parse_mode='HTML')
 
 async def help_cmd(update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /help"""
     text = (
-        "📚 <b>ПОМОЩЬ ПО БОТУ</b>\n\n"
-        "<b>🎯 Как работает бот:</b>\n"
-        "1. Каждый день в 17:30 МСК запускается автосканирование\n"
-        "2. Бот анализирует все акции MOEX с объемом от 10 млн ₽\n"
-        "3. Ищет падение на 10%+ за последние 3 дня\n"
-        f"4. Рассчитывает автоматический стоп-лосс: <b>{STOP_LOSS_PERCENT}%</b>\n"
-        "5. Показывает тейк-профит (соотношение 1:2)\n"
-        "6. Отправляет отчет с результатами\n\n"
-        "<b>🛑 Как работает стоп-лосс:</b>\n"
-        f"• Формула: SL = Цена входа × (1 - {STOP_LOSS_PERCENT}/100)\n"
-        "• Пример: цена 100₽, SL 2%\n"
-        "  - Стоп-лосс: 100 × 0.98 = <b>98₽</b>\n"
-        "  - Риск на акцию: <b>2₽</b>\n"
-        "  - Тейк-профит: 100 × 1.04 = <b>104₽</b>\n"
-        "  - Потенциальная прибыль: <b>4₽</b>\n"
-        "  - R/R: <b>1:2</b>\n\n"
-        "<b>📊 Что в отчете:</b>\n"
-        "• Тикер и название акции\n"
-        "• Процент падения\n"
-        "• Цена входа (текущая)\n"
-        f"• 🛑 Стоп-лосс ({STOP_LOSS_PERCENT}%)\n"
-        "• ⚠️ Риск на акцию в рублях\n"
-        "• 🎯 Тейк-профит (+прибыль)\n"
-        "• 📊 Соотношение риск/прибыль\n"
-        "• Объем торгов\n"
-        "• Новости (если найдены)\n"
-        "• Ссылка на график TradingView\n\n"
+        "📚 <b>ПОМОЩЬ</b>\n\n"
+        "<b>Как работает:</b>\n"
+        "1. Сканирование в 17:30 МСК\n"
+        "2. Анализ акций MOEX\n"
+        "3. Поиск падения ≥10% за 3 дня\n"
+        "4. Расчет стоп-лосса и тейк-профита\n\n"
+        "<b>Стоп-лосс:</b>\n"
+        f"SL = Цена × (1 - {STOP_LOSS_PERCENT}/100)\n"
+        "Пример: 100₽ × 0.98 = 98₽\n"
+        "Риск: 2₽ на акцию\n\n"
         "<b>Команды:</b>\n"
         "/scan — ручной запуск\n"
-        "/status — статус бота\n"
-        "/start — информация"
+        "/status — статус\n"
+        "/start — главная"
     )
     await update.message.reply_text(text, parse_mode='HTML')
 
-# ---------- АВТОМАТИЧЕСКОЕ СКАНИРОВАНИЕ ----------
+# ---------- АВТОСКАНИРОВАНИЕ ----------
 async def scheduled_scan_1730(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматическое сканирование в 17:30 МСК"""
     logger.info("=" * 50)
     logger.info("🕔 ЗАПУСК АВТОСКАНИРОВАНИЯ (17:30 МСК)")
     logger.info("=" * 50)
@@ -742,7 +660,7 @@ async def scheduled_scan_1730(context: ContextTypes.DEFAULT_TYPE):
             bot = Bot(token=TELEGRAM_BOT_TOKEN)
             await bot.send_message(
                 chat_id=TELEGRAM_USER_ID,
-                text=f"❌ <b>Ошибка автосканирования!</b>\n\n{escape_html(str(e)[:300])}",
+                text=f"❌ <b>Ошибка!</b>\n{escape_html(str(e)[:300])}",
                 parse_mode='HTML'
             )
         except:
@@ -752,12 +670,10 @@ async def scheduled_scan_1730(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ Токен не найден!")
-        print("Ошибка: укажите TELEGRAM_BOT_TOKEN в .env файле")
         sys.exit(1)
     
     if TELEGRAM_USER_ID == 0:
-        logger.error("❌ ADMIN_CHAT_ID не найден!")
-        print("Ошибка: укажите TELEGRAM_USER_ID в .env файле")
+        logger.error("❌ USER_ID не найден!")
         sys.exit(1)
     
     logger.info("=" * 50)
@@ -766,19 +682,11 @@ def main():
     logger.info(f"📊 Падение: ≥{DROP_PERCENT}% за {DAYS_BACK} дн.")
     logger.info(f"💰 Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽")
     logger.info(f"🛑 Стоп-лосс: {STOP_LOSS_PERCENT}%")
-    logger.info(f"📊 Соотношение R/R: 1:2")
-    logger.info(f"🕐 Автосканирование: 17:30 МСК ежедневно")
-    logger.info(f"👤 Чат ID: {TELEGRAM_USER_ID}")
+    logger.info(f"📊 R/R: 1:2")
     
-    # Демонстрация расчета стоп-лосса
     demo_price = 100
     demo_sl = calculate_stop_loss(demo_price, STOP_LOSS_PERCENT)
-    logger.info(f"💡 Пример расчета SL:")
-    logger.info(f"   Цена: {demo_price}₽")
-    logger.info(f"   SL ({STOP_LOSS_PERCENT}%): {demo_sl['stop_loss_price']}₽")
-    logger.info(f"   Риск: {demo_sl['risk_per_share']}₽")
-    logger.info(f"   TP: {demo_sl['take_profit_price']}₽")
-    logger.info(f"   R/R: {demo_sl['risk_reward_ratio']}")
+    logger.info(f"💡 Пример SL: цена {demo_price}₽ → SL {demo_sl['stop_loss_price']}₽ → TP {demo_sl['take_profit_price']}₽")
     
     # Создаем приложение
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -789,36 +697,79 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     
-    # Настраиваем ежедневный запуск в 17:30 МСК с правильной таймзоной
-    job_queue = app.job_queue
-    if job_queue:
-        # Используем московскую таймзону
+    # Планировщик без JobQueue (чтобы избежать ошибок с зависимостями)
+    async def scheduler_loop():
+        """Фоновый планировщик"""
         msk_tz = pytz.timezone('Europe/Moscow')
-        job_queue.run_daily(
-            scheduled_scan_1730,
-            time=time(hour=17, minute=30, tzinfo=msk_tz),  # 17:30 МСК
-            days=(0, 1, 2, 3, 4, 5, 6)  # Все дни недели
-        )
-        logger.info("✅ Автосканирование настроено на 17:30 МСК")
-    else:
-        logger.error("❌ Не удалось настроить JobQueue!")
+        
+        while True:
+            now = datetime.now(msk_tz)
+            next_run = now.replace(hour=17, minute=30, second=0, microsecond=0)
+            
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            
+            wait_seconds = (next_run - now).total_seconds()
+            logger.info(f"⏰ Следующее сканирование через {wait_seconds/3600:.1f} ч.")
+            
+            await asyncio.sleep(wait_seconds)
+            
+            logger.info("🕔 Запуск автосканирования (17:30 МСК)")
+            try:
+                results = await scan_market()
+                
+                bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                
+                if results:
+                    header = (
+                        f"📊 <b>АВТООТЧЕТ: ПАДАЮЩИЕ АКЦИИ</b>\n"
+                        f"📅 {datetime.now(msk_tz).strftime('%d.%m.%Y')}\n"
+                        f"⏰ 17:30 МСК\n"
+                        f"Найдено: <b>{len(results)}</b> акций"
+                    )
+                    await bot.send_message(chat_id=TELEGRAM_USER_ID, text=header, parse_mode='HTML')
+                    
+                    for i, r in enumerate(results, 1):
+                        sl = r['stop_loss']
+                        text = (
+                            f"🔻 <b>#{i} {r['ticker']}</b> — {escape_html(r['name'])}\n"
+                            f"📉 <b>{r['change_pct']}%</b> | 💰 {r['price_to']}₽\n"
+                            f"🛑 SL: <b>{sl['stop_loss_price']}₽</b> | 🎯 TP: <b>{sl['take_profit_price']}₽</b>"
+                        )
+                        await bot.send_message(
+                            chat_id=TELEGRAM_USER_ID,
+                            text=text,
+                            parse_mode='HTML',
+                            reply_markup=create_tradingview_keyboard(r['ticker'])
+                        )
+                        await asyncio.sleep(0.5)
+                    
+                    await bot.send_message(chat_id=TELEGRAM_USER_ID, text="✅ Отчет завершен")
+                else:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_USER_ID,
+                        text=f"📉 Акций с падением ≥{DROP_PERCENT}% не найдено"
+                    )
+                
+            except Exception as e:
+                logger.error(f"💥 Ошибка: {e}", exc_info=True)
+    
+    # Запускаем планировщик в фоне
+    asyncio.create_task(scheduler_loop())
     
     print("\n" + "=" * 50)
     print("✅ Бот запущен!")
     print("=" * 50)
-    print(f"📊 Анализ: падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.")
-    print(f"💰 Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽")
-    print(f"🛑 Стоп-лосс: {STOP_LOSS_PERCENT}%")
-    print(f"📊 R/R: 1:2")
-    print("🕐 Автоуведомления: каждый день в 17:30 МСК")
+    print(f"📊 Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.")
+    print(f"🛑 SL: {STOP_LOSS_PERCENT}% | R/R: 1:2")
+    print("🕐 Автоуведомления: 17:30 МСК")
     print("📋 Команды: /start, /scan, /status, /help")
-    print("Нажмите Ctrl+C для остановки\n")
+    print("=" * 50)
     
     try:
         app.run_polling(allowed_updates=["message"])
     except KeyboardInterrupt:
-        logger.info("👋 Бот остановлен пользователем")
-        print("\n👋 Бот остановлен")
+        logger.info("👋 Бот остановлен")
 
 if __name__ == '__main__':
     main()
