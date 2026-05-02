@@ -667,6 +667,7 @@ async def scheduled_scan_1730(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ---------- ЗАПУСК ----------
+# ---------- ЗАПУСК (ИСПРАВЛЕНО) ----------
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ Токен не найден!")
@@ -688,6 +689,15 @@ def main():
     demo_sl = calculate_stop_loss(demo_price, STOP_LOSS_PERCENT)
     logger.info(f"💡 Пример SL: цена {demo_price}₽ → SL {demo_sl['stop_loss_price']}₽ → TP {demo_sl['take_profit_price']}₽")
     
+    print("\n" + "=" * 50)
+    print("✅ Бот запускается...")
+    print("=" * 50)
+    print(f"📊 Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.")
+    print(f"🛑 SL: {STOP_LOSS_PERCENT}% | R/R: 1:2")
+    print("🕐 Автоуведомления: 17:30 МСК")
+    print("📋 Команды: /start, /scan, /status, /help")
+    print("=" * 50)
+    
     # Создаем приложение
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
@@ -697,79 +707,149 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     
-    # Планировщик без JobQueue (чтобы избежать ошибок с зависимостями)
+    # Планировщик автосканирования
     async def scheduler_loop():
-        """Фоновый планировщик"""
+        """Фоновый планировщик для автосканирования в 17:30 МСК"""
         msk_tz = pytz.timezone('Europe/Moscow')
+        logger.info("🔄 Планировщик автосканирования запущен")
         
         while True:
-            now = datetime.now(msk_tz)
-            next_run = now.replace(hour=17, minute=30, second=0, microsecond=0)
-            
-            if now >= next_run:
-                next_run += timedelta(days=1)
-            
-            wait_seconds = (next_run - now).total_seconds()
-            logger.info(f"⏰ Следующее сканирование через {wait_seconds/3600:.1f} ч.")
-            
-            await asyncio.sleep(wait_seconds)
-            
-            logger.info("🕔 Запуск автосканирования (17:30 МСК)")
             try:
-                results = await scan_market()
+                now = datetime.now(msk_tz)
                 
-                bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                # Следующий запуск в 17:30 МСК
+                next_run = now.replace(hour=17, minute=30, second=0, microsecond=0)
                 
-                if results:
-                    header = (
-                        f"📊 <b>АВТООТЧЕТ: ПАДАЮЩИЕ АКЦИИ</b>\n"
-                        f"📅 {datetime.now(msk_tz).strftime('%d.%m.%Y')}\n"
-                        f"⏰ 17:30 МСК\n"
-                        f"Найдено: <b>{len(results)}</b> акций"
-                    )
-                    await bot.send_message(chat_id=TELEGRAM_USER_ID, text=header, parse_mode='HTML')
+                # Если время уже прошло, планируем на завтра
+                if now >= next_run:
+                    next_run += timedelta(days=1)
+                
+                # Время ожидания
+                wait_seconds = (next_run - now).total_seconds()
+                
+                logger.info(f"⏰ Следующее автосканирование: {next_run.strftime('%d.%m.%Y %H:%M')} МСК")
+                logger.info(f"⏳ Ожидание: {wait_seconds/3600:.1f} часов ({wait_seconds:.0f} секунд)")
+                
+                # Ждем до времени запуска
+                await asyncio.sleep(wait_seconds)
+                
+                # Запускаем сканирование
+                logger.info("=" * 50)
+                logger.info("🕔 ЗАПУСК АВТОСКАНИРОВАНИЯ (17:30 МСК)")
+                logger.info("=" * 50)
+                
+                try:
+                    results = await scan_market()
                     
-                    for i, r in enumerate(results, 1):
-                        sl = r['stop_loss']
-                        text = (
-                            f"🔻 <b>#{i} {r['ticker']}</b> — {escape_html(r['name'])}\n"
-                            f"📉 <b>{r['change_pct']}%</b> | 💰 {r['price_to']}₽\n"
-                            f"🛑 SL: <b>{sl['stop_loss_price']}₽</b> | 🎯 TP: <b>{sl['take_profit_price']}₽</b>"
+                    # Отправляем результаты
+                    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                    
+                    if results:
+                        # Отправляем заголовок
+                        header = (
+                            f"📊 <b>АВТООТЧЕТ: ПАДАЮЩИЕ АКЦИИ</b>\n"
+                            f"📅 {datetime.now(msk_tz).strftime('%d.%m.%Y')}\n"
+                            f"⏰ 17:30 МСК\n"
+                            f"{'=' * 30}\n"
+                            f"Найдено: <b>{len(results)}</b> акций\n"
+                            f"Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.\n"
+                            f"Стоп-лосс: <b>{STOP_LOSS_PERCENT}%</b>\n"
+                            f"R/R: 1:2"
                         )
                         await bot.send_message(
                             chat_id=TELEGRAM_USER_ID,
-                            text=text,
-                            parse_mode='HTML',
-                            reply_markup=create_tradingview_keyboard(r['ticker'])
+                            text=header,
+                            parse_mode='HTML'
                         )
-                        await asyncio.sleep(0.5)
+                        
+                        # Отправляем каждый результат
+                        for i, r in enumerate(results, 1):
+                            sl = r['stop_loss']
+                            text = (
+                                f"🔻 <b>#{i} {r['ticker']}</b> — {escape_html(r['name'])}\n"
+                                f"{'─' * 25}\n"
+                                f"📉 Падение: <b>{r['change_pct']}%</b>\n"
+                                f"💰 Цена входа: <b>{r['price_to']}₽</b>\n"
+                                f"🛑 SL: <b>{sl['stop_loss_price']}₽</b> (-{STOP_LOSS_PERCENT}%)\n"
+                                f"⚠️ Риск: <b>{sl['risk_per_share']}₽</b>\n"
+                                f"🎯 TP: <b>{sl['take_profit_price']}₽</b> (+{sl['potential_profit_per_share']}₽)\n"
+                                f"📊 R/R: <b>{sl['risk_reward_ratio']}</b>\n"
+                                f"💵 Объем: {r['volume_rub']:,.0f}₽"
+                            )
+                            
+                            if r['news_title'] and r['news_url']:
+                                text += f"\n📰 <a href='{r['news_url']}'>{escape_html(r['news_title'])}</a>"
+                            
+                            try:
+                                await bot.send_message(
+                                    chat_id=TELEGRAM_USER_ID,
+                                    text=text,
+                                    parse_mode='HTML',
+                                    reply_markup=create_tradingview_keyboard(r['ticker'])
+                                )
+                                await asyncio.sleep(0.5)
+                            except Exception as send_err:
+                                logger.error(f"Ошибка отправки {r['ticker']}: {send_err}")
+                        
+                        # Итоговое сообщение
+                        await bot.send_message(
+                            chat_id=TELEGRAM_USER_ID,
+                            text=f"✅ Отчет завершен\n🕒 {datetime.now(msk_tz).strftime('%H:%M:%S')} МСК"
+                        )
+                        
+                        logger.info(f"✅ Автоотчет отправлен: {len(results)} сигналов")
+                    else:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_USER_ID,
+                            text=f"📉 <b>Акций с падением ≥{DROP_PERCENT}% не найдено</b>\n\n"
+                                 f"💰 Мин. объем: {MIN_VOLUME/1e6:.0f} млн ₽\n"
+                                 f"🕒 {datetime.now(msk_tz).strftime('%H:%M:%S')} МСК",
+                            parse_mode='HTML'
+                        )
+                        logger.info("✅ Автоотчет: падающих акций нет")
                     
-                    await bot.send_message(chat_id=TELEGRAM_USER_ID, text="✅ Отчет завершен")
-                else:
-                    await bot.send_message(
-                        chat_id=TELEGRAM_USER_ID,
-                        text=f"📉 Акций с падением ≥{DROP_PERCENT}% не найдено"
-                    )
+                except Exception as e:
+                    logger.error(f"💥 Ошибка автосканирования: {e}", exc_info=True)
+                    try:
+                        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                        await bot.send_message(
+                            chat_id=TELEGRAM_USER_ID,
+                            text=f"❌ <b>Ошибка автосканирования!</b>\n\n{escape_html(str(e)[:300])}",
+                            parse_mode='HTML'
+                        )
+                    except:
+                        pass
                 
+                # Небольшая пауза перед следующим циклом
+                await asyncio.sleep(60)
+                
+            except asyncio.CancelledError:
+                logger.info("🛑 Планировщик остановлен")
+                break
             except Exception as e:
-                logger.error(f"💥 Ошибка: {e}", exc_info=True)
+                logger.error(f"💥 Ошибка в планировщике: {e}", exc_info=True)
+                await asyncio.sleep(300)  # 5 минут перед повторной попыткой
     
-    # Запускаем планировщик в фоне
-    asyncio.create_task(scheduler_loop())
+    # Функция для запуска планировщика после старта бота
+    async def post_init(application: Application):
+        """Запускается после инициализации приложения"""
+        logger.info("🔧 Инициализация планировщика...")
+        asyncio.create_task(scheduler_loop())
+        logger.info("✅ Планировщик запущен в фоне")
     
-    print("\n" + "=" * 50)
-    print("✅ Бот запущен!")
-    print("=" * 50)
-    print(f"📊 Падение ≥{DROP_PERCENT}% за {DAYS_BACK} дн.")
-    print(f"🛑 SL: {STOP_LOSS_PERCENT}% | R/R: 1:2")
-    print("🕐 Автоуведомления: 17:30 МСК")
-    print("📋 Команды: /start, /scan, /status, /help")
-    print("=" * 50)
+    # Регистрируем post_init callback
+    app.post_init = post_init
     
     try:
+        logger.info("🚀 Запуск бота...")
         app.run_polling(allowed_updates=["message"])
     except KeyboardInterrupt:
-        logger.info("👋 Бот остановлен")
+        logger.info("👋 Бот остановлен пользователем")
+        print("\n👋 Бот остановлен")
+    except Exception as e:
+        logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
+        print(f"\n❌ Ошибка: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
