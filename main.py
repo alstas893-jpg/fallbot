@@ -14,6 +14,7 @@ from newsapi import NewsApiClient
 import os
 import re
 import sys
+import pytz
 from dotenv import load_dotenv
 
 # Настройка event loop для Windows
@@ -63,7 +64,7 @@ if TELEGRAM_USER_ID == 0:
 DROP_PERCENT = float(os.getenv("DROP_PERCENT", "10.0"))
 DAYS_BACK = int(os.getenv("DAYS_BACK", "3"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10000000"))
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2.0"))  # Стоп-лосс 2%
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2.0"))
 CACHE_DB = "moex_cache.db"
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "1"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "20"))
@@ -271,6 +272,15 @@ def calculate_stop_loss(price: float, stop_loss_percent: float) -> Dict:
     Расчет уровней стоп-лосса
     Возвращает словарь с уровнями
     """
+    if price <= 0 or stop_loss_percent <= 0:
+        return {
+            'current_price': 0,
+            'stop_loss_percent': 0,
+            'stop_loss_price': 0,
+            'stop_loss_amount': 0,
+            'risk_per_share': 0
+        }
+    
     sl_price = round(price * (1 - stop_loss_percent / 100), 2)
     sl_amount = round(price - sl_price, 2)
     
@@ -282,60 +292,135 @@ def calculate_stop_loss(price: float, stop_loss_percent: float) -> Dict:
         'risk_per_share': sl_amount
     }
 
-# ---------- АНАЛИЗ ----------
+# ---------- АНАЛИЗ (ИСПРАВЛЕНО) ----------
 async def analyze_ticker(api: MoexAPI, ticker: str, name: str, volume: float) -> Optional[Dict]:
     try:
+        # 1. Получаем данные (из кэша или API)
         cached = await get_cached_prices(ticker)
         
         if cached:
-            df = pd.DataFrame(list(cached.items()), columns=['date', 'close'])
-            df['date'] = pd.to_datetime(df['date']).dt.date
+            # Преобразуем словарь в DataFrame
+            records = []
+            for date_str, close_val in cached.items():
+                try:
+                    d = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    records.append({'date': d, 'close': float(close_val)})
+                except (ValueError, TypeError):
+                    continue
+            
+            if not records:
+                logger.debug(f"{ticker}: нет валидных записей в кэше")
+                return None
+            df = pd.DataFrame(records)
         else:
+            # Запрашиваем с запасом +10 дней для надежности
             df = await api.get_history(ticker, days_back=DAYS_BACK + 10)
+            
             if df is not None and not df.empty:
-                cache_data = dict(zip(df['date'].astype(str), df['close']))
-                await set_cached_prices(ticker, cache_data)
+                # Сохраняем в кэш
+                cache_data = {}
+                for _, row in df.iterrows():
+                    try:
+                        d = row['date']
+                        if hasattr(d, 'strftime'):
+                            cache_data[d.strftime('%Y-%m-%d')] = float(row['close'])
+                        else:
+                            cache_data[str(d)] = float(row['close'])
+                    except Exception:
+                        continue
+                if cache_data:
+                    await set_cached_prices(ticker, cache_data)
         
-        if df is None or len(df) < DAYS_BACK:
+        # 2. Проверки данных
+        if df is None or df.empty:
+            logger.debug(f"{ticker}: нет данных для анализа")
             return None
         
-        df = df.sort_values('date')
+        df = df.sort_values('date').reset_index(drop=True)
         
+        if len(df) < 2:
+            logger.debug(f"{ticker}: недостаточно данных (только {len(df)} точка)")
+            return None
+        
+        # 3. Последняя цена и дата
         latest = df.iloc[-1]
-        old = df.iloc[-(DAYS_BACK)]
-        
         latest_price = float(latest['close'])
-        old_price = float(old['close'])
+        latest_date = latest['date']
         
+        # Приводим дату к date, если это datetime
+        if hasattr(latest_date, 'date'):
+            latest_date = latest_date.date()
+        
+        if latest_price <= 0:
+            logger.warning(f"{ticker}: некорректная последняя цена {latest_price}")
+            return None
+        
+        # 4. Целевая дата (DAYS_BACK календарных дней назад)
+        target_date = latest_date - timedelta(days=DAYS_BACK)
+        
+        # 5. Ищем старую цену по дате, а не по индексу!
+        old_candidates = df[df['date'] <= target_date].copy()
+        
+        if old_candidates.empty:
+            # Если нет данных за целевой период — берем самую старую доступную запись
+            if len(df) >= 2:
+                # Берем самую первую запись
+                old_candidates = df.head(1)
+                logger.debug(
+                    f"{ticker}: нет данных за {target_date}, "
+                    f"использую самую старую: {old_candidates.iloc[0]['date']}"
+                )
+            else:
+                return None
+        
+        old = old_candidates.iloc[-1]  # Самая поздняя запись среди подходящих
+        old_price = float(old['close'])
+        old_date = old['date']
+        
+        # Приводим дату к date
+        if hasattr(old_date, 'date'):
+            old_date = old_date.date()
+        
+        if old_price <= 0:
+            logger.warning(f"{ticker}: некорректная старая цена {old_price}")
+            return None
+        
+        # 6. Считаем процент изменения
         change_pct = ((latest_price - old_price) / old_price) * 100
         
+        # 7. Проверяем порог падения
         if change_pct <= -DROP_PERCENT:
+            # Получаем новости
             news_info = get_news_for_ticker(ticker, name)
+            
+            # Рассчитываем стоп-лосс
             stop_loss = calculate_stop_loss(latest_price, STOP_LOSS_PERCENT)
             
             result = {
                 'ticker': ticker,
                 'name': name,
                 'change_pct': round(change_pct, 2),
-                'date_from': old['date'],
+                'date_from': str(old_date),
                 'price_from': round(old_price, 2),
-                'date_to': latest['date'],
+                'date_to': str(latest_date),
                 'price_to': round(latest_price, 2),
                 'volume_rub': volume,
                 'stop_loss': stop_loss,
+                'news_title': news_info[0] if news_info else None,
+                'news_url': news_info[1] if news_info else None
             }
             
-            if news_info:
-                result['news_title'] = news_info[0]
-                result['news_url'] = news_info[1]
-            else:
-                result['news_title'] = None
-                result['news_url'] = None
-            
-            logger.info(f"🔻 {ticker}: {change_pct:.2f}% | SL: {stop_loss['stop_loss_price']}₽ | Объем: {volume:,.0f}₽")
+            logger.info(
+                f"🔻 {ticker}: {change_pct:+.2f}% "
+                f"({old_date} {old_price}₽ → {latest_date} {latest_price}₽) "
+                f"| SL: {stop_loss['stop_loss_price']}₽ | V: {volume:,.0f}₽"
+            )
             return result
+        else:
+            logger.debug(f"{ticker}: падение {change_pct:+.2f}% (порог: -{DROP_PERCENT}%)")
+    
     except Exception as e:
-        logger.error(f"🔥 Ошибка анализа {ticker}: {e}")
+        logger.error(f"🔥 Ошибка анализа {ticker}: {e}", exc_info=True)
     
     return None
 
@@ -529,12 +614,15 @@ async def scan_cmd(update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_cmd(update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /status"""
-    # Следующий запуск в 17:30
-    next_run = datetime.now().replace(hour=17, minute=30, second=0, microsecond=0)
-    if datetime.now() > next_run:
+    # Следующий запуск в 17:30 МСК
+    msk_tz = pytz.timezone('Europe/Moscow')
+    now_msk = datetime.now(msk_tz)
+    
+    next_run = now_msk.replace(hour=17, minute=30, second=0, microsecond=0)
+    if now_msk > next_run:
         next_run += timedelta(days=1)
     
-    time_to_next = next_run - datetime.now()
+    time_to_next = next_run - now_msk
     hours, remainder = divmod(time_to_next.seconds, 3600)
     minutes = remainder // 60
     
@@ -632,16 +720,17 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     
-    # Настраиваем ежедневный запуск в 17:30 МСК
+    # Настраиваем ежедневный запуск в 17:30 МСК с правильной таймзоной
     job_queue = app.job_queue
     if job_queue:
-        # 17:30 МСК = 14:30 UTC
+        # Используем московскую таймзону
+        msk_tz = pytz.timezone('Europe/Moscow')
         job_queue.run_daily(
             scheduled_scan_1730,
-            time=time(hour=14, minute=30),  # 14:30 UTC = 17:30 МСК
+            time=time(hour=17, minute=30, tzinfo=msk_tz),  # 17:30 МСК
             days=(0, 1, 2, 3, 4, 5, 6)  # Все дни недели
         )
-        logger.info("✅ Автосканирование настроено на 17:30 МСК (14:30 UTC)")
+        logger.info("✅ Автосканирование настроено на 17:30 МСК")
     else:
         logger.error("❌ Не удалось настроить JobQueue!")
     
