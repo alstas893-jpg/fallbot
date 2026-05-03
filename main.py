@@ -31,12 +31,13 @@ logger = logging.getLogger(__name__)
 
 # ================= НАСТРОЙКИ =================
 MIN_DROP_PERCENT = 10.0
-MIN_DAILY_VOLUME_RUB = 30_000_000
-MIN_AVG_VOLUME_5D = 100_000_000
+MIN_DAILY_VOLUME_RUB = 50_000_000  # Уменьшено до 50 млн руб
+MIN_AVG_VOLUME_5D = 50_000_000  # Также уменьшено до 50 млн руб для фильтрации
 LOOKBACK_TRADING_DAYS = 3
 VOLUME_DAYS = 5
-SCAN_INTERVAL_MINUTES = 5
-SCAN_INTERVAL_SECONDS = SCAN_INTERVAL_MINUTES * 60
+
+# Фиксированное время сканирования (МСК)
+SCAN_TIMES = ["12:20", "18:20"]
 
 # ================= ТОРГОВЫЕ СЕССИИ =================
 class TradingSession:
@@ -95,7 +96,7 @@ def create_tradingview_keyboard(ticker: str) -> InlineKeyboardMarkup:
     ]])
 
 
-# ================= MOEX API (ИСПРАВЛЕННАЯ ВЕРСИЯ) =================
+# ================= MOEX API =================
 class MoexAPI:
     BASE = 'https://iss.moex.com/iss'
     
@@ -110,7 +111,7 @@ class MoexAPI:
         async with self._session_lock:
             if self._session is None or self._session.closed:
                 timeout = aiohttp.ClientTimeout(total=30)
-                connector = aiohttp.TCPConnector(force_close=True)  # Принудительно закрываем соединения
+                connector = aiohttp.TCPConnector(force_close=True)
                 self._session = aiohttp.ClientSession(
                     timeout=timeout,
                     connector=connector
@@ -123,7 +124,7 @@ class MoexAPI:
             if self._session and not self._session.closed:
                 try:
                     await self._session.close()
-                    await asyncio.sleep(0.1)  # Даем время на закрытие
+                    await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.debug(f"Ошибка при закрытии сессии: {e}")
                 finally:
@@ -141,7 +142,6 @@ class MoexAPI:
                     logger.warning(f"HTTP {r.status} для {url}")
         except aiohttp.ClientError as e:
             logger.error(f"Ошибка HTTP запроса: {e}")
-            # При ошибке создаем новую сессию при следующем запросе
             await self.close()
         except asyncio.TimeoutError:
             logger.error(f"Таймаут запроса: {url}")
@@ -153,9 +153,8 @@ class MoexAPI:
     
     async def get_all_tickers(self) -> List[str]:
         """Получение списка всех акций с фильтрацией по объему"""
-        cache_minutes = 10 if SCAN_INTERVAL_MINUTES <= 10 else 30
         if self._tickers_cache and self._cache_time:
-            if datetime.now() - self._cache_time < timedelta(minutes=cache_minutes):
+            if datetime.now() - self._cache_time < timedelta(hours=1):
                 return self._tickers_cache
         
         logger.info("📊 Получение списка всех акций с МосБиржи...")
@@ -296,7 +295,7 @@ class DropScanner:
         
         self.last_scan_time = datetime.now()
         
-        logger.info(f"🔍 Сканирование падающих акций (каждые {SCAN_INTERVAL_MINUTES} мин)")
+        logger.info(f"🔍 Сканирование падающих акций")
         logger.info(f"📋 Сканируется {len(tickers)} акций")
         
         drops = []
@@ -412,19 +411,20 @@ async def send_scan_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int = N
         drops, excluded_liquidity, excluded_other, total_checked = await scanner.scan_drops()
         
         session_status = TradingSession.get_session_status_text()
+        msk_time = datetime.now(timezone(timedelta(hours=3)))
         
         if not drops:
             text = (
                 f"📊 <b>Падающих акций не найдено</b>\n\n"
                 f"{session_status}\n"
                 f"📈 Просканировано: <b>{total_checked}</b>\n"
-                f"🔄 Следующее сканирование через {SCAN_INTERVAL_MINUTES} мин.\n\n"
-                f"💡 Критерии: падение ≥{MIN_DROP_PERCENT}%, объем ≥{MIN_DAILY_VOLUME_RUB/1e6:.0f} млн ₽"
+                f"🕐 {msk_time.strftime('%H:%M:%S')} МСК\n\n"
+                f"💡 Критерии: падение ≥{MIN_DROP_PERCENT}%, объем ≥{MIN_DAILY_VOLUME_RUB/1e6:.0f} млн ₽\n"
+                f"📅 Следующее сканирование: {', '.join(SCAN_TIMES)} МСК"
             )
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
             return
         
-        msk_time = datetime.now() + timedelta(hours=3)
         header = (
             f"🔻 <b>НАЙДЕНО ПАДЕНИЙ: {len(drops)}</b>\n"
             f"{session_status}\n"
@@ -485,8 +485,8 @@ async def send_scan_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int = N
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🔻 <b>MOEX Drop Scanner Bot v2.0</b>\n\n"
-        f"🔄 Автосканирование каждые {SCAN_INTERVAL_MINUTES} мин.\n"
+        f"🔻 <b>MOEX Drop Scanner Bot v3.0</b>\n\n"
+        f"📅 Автосканирование в {', '.join(SCAN_TIMES)} МСК\n"
         f"📉 Падение ≥{MIN_DROP_PERCENT}% за {LOOKBACK_TRADING_DAYS} дн.\n"
         f"💰 Объем ≥{MIN_DAILY_VOLUME_RUB/1e6:.0f} млн ₽\n\n"
         f"/scan - ручное сканирование\n"
@@ -514,6 +514,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if scan_jobs and scan_jobs[0].next_t:
         next_run = scan_jobs[0].next_t + timedelta(hours=3)
         text += f"Следующее: {next_run.strftime('%H:%M:%S')} МСК\n"
+    
+    text += f"Расписание: {', '.join(SCAN_TIMES)} МСК\n"
     
     if scanner.last_scan_time:
         text += f"Последнее: {(scanner.last_scan_time + timedelta(hours=3)).strftime('%H:%M:%S')} МСК\n"
@@ -546,25 +548,49 @@ async def start_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔄 Автосканирование уже запущено")
         return
     
-    context.job_queue.run_repeating(
-        auto_scan_job,
-        interval=SCAN_INTERVAL_SECONDS,
-        first=10,
-        name="auto_scan"
-    )
+    # Удаляем старые запланированные задачи
+    for job in jobs:
+        if 'scan_time' in job.name.lower():
+            job.schedule_removal()
     
-    await update.message.reply_text(f"🔄 Автосканирование запущено (каждые {SCAN_INTERVAL_MINUTES} мин)")
+    # Добавляем задачи на конкретное время
+    for scan_time in SCAN_TIMES:
+        hour, minute = map(int, scan_time.split(':'))
+        
+        # Вычисляем время первого запуска
+        msk_tz = timezone(timedelta(hours=3))
+        now = datetime.now(msk_tz)
+        target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        # Если время уже прошло сегодня, запускаем завтра
+        if target_time <= now:
+            target_time += timedelta(days=1)
+        
+        # Конвертируем в UTC для JobQueue
+        utc_time = target_time - timedelta(hours=3)
+        
+        context.job_queue.run_daily(
+            auto_scan_job,
+            time=utc_time.time(),
+            name=f"scan_time_{scan_time}"
+        )
+    
+    await update.message.reply_text(
+        f"🔄 Автосканирование запущено\n"
+        f"📅 Расписание: {', '.join(SCAN_TIMES)} МСК"
+    )
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Функция для автоматического сканирования"""
-    logger.info(f"🔄 Автосканирование (каждые {SCAN_INTERVAL_MINUTES} мин)")
+    msk_time = datetime.now(timezone(timedelta(hours=3)))
+    logger.info(f"🔄 Автосканирование в {msk_time.strftime('%H:%M:%S')} МСК")
     await send_scan_results(context)
 
 async def cleanup():
     """Очистка ресурсов"""
     logger.info("🧹 Очистка ресурсов...")
     await api.close()
-    await asyncio.sleep(0.2)  # Даем время на закрытие соединений
+    await asyncio.sleep(0.2)
 
 def main():
     if not TOKEN:
@@ -576,13 +602,13 @@ def main():
         sys.exit(1)
     
     logger.info("=" * 50)
-    logger.info("🔻 MOEX DROP SCANNER BOT v2.0")
-    logger.info(f"🔄 Автосканирование: каждые {SCAN_INTERVAL_MINUTES} мин")
+    logger.info("🔻 MOEX DROP SCANNER BOT v3.0")
+    logger.info(f"📅 Автосканирование: {', '.join(SCAN_TIMES)} МСК")
+    logger.info(f"💰 Мин. объем: {MIN_DAILY_VOLUME_RUB/1e6:.0f} млн ₽")
     logger.info("=" * 50)
     
     app = Application.builder().token(TOKEN).build()
     
-    # Проверяем доступность JobQueue
     if app.job_queue is None:
         logger.warning("⚠️ JobQueue не настроен. Автосканирование не будет работать.")
         logger.warning("Установите: pip install 'python-telegram-bot[job-queue]'")
@@ -593,19 +619,33 @@ def main():
     app.add_handler(CommandHandler("stop_scan", stop_scan_cmd))
     app.add_handler(CommandHandler("start_scan", start_scan_cmd))
     
-    # Запускаем автосканирование если JobQueue доступен
+    # Запускаем автосканирование по расписанию
     if app.job_queue:
-        app.job_queue.run_repeating(
-            auto_scan_job,
-            interval=SCAN_INTERVAL_SECONDS,
-            first=10,
-            name="auto_scan"
-        )
-        logger.info(f"🔄 Автосканирование запущено: каждые {SCAN_INTERVAL_MINUTES} минут")
+        msk_tz = timezone(timedelta(hours=3))
+        now = datetime.now(msk_tz)
+        
+        for scan_time in SCAN_TIMES:
+            hour, minute = map(int, scan_time.split(':'))
+            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            
+            # Если время уже прошло сегодня, запускаем завтра
+            if target_time <= now:
+                target_time += timedelta(days=1)
+            
+            # Конвертируем в UTC для JobQueue
+            utc_time = target_time - timedelta(hours=3)
+            
+            app.job_queue.run_daily(
+                auto_scan_job,
+                time=utc_time.time(),
+                name=f"scan_time_{scan_time}"
+            )
+            logger.info(f"📅 Запланировано сканирование на {scan_time} МСК")
     
     print("\n" + "=" * 50)
     print("✅ Бот запущен!")
-    print(f"🔄 Автосканирование каждые {SCAN_INTERVAL_MINUTES} минут")
+    print(f"📅 Автосканирование в {', '.join(SCAN_TIMES)} МСК")
+    print(f"💰 Мин. объем: {MIN_DAILY_VOLUME_RUB/1e6:.0f} млн ₽")
     print("Нажмите Ctrl+C для остановки\n")
     
     try:
@@ -614,7 +654,6 @@ def main():
         logger.info("👋 Бот остановлен")
         print("\n👋 Бот остановлен")
     finally:
-        # Правильное завершение
         loop = asyncio.new_event_loop()
         loop.run_until_complete(cleanup())
         loop.close()
