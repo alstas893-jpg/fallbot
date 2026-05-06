@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 
 # ================= НАСТРОЙКИ =================
 MIN_DROP_PERCENT = 10.0
-MIN_DAILY_VOLUME_RUB = 50_000_000  # Уменьшено до 50 млн руб
-MIN_AVG_VOLUME_5D = 50_000_000  # Также уменьшено до 50 млн руб для фильтрации
+MIN_DAILY_VOLUME_RUB = 30_000_000  # Изменено на 30 млн руб
+MIN_AVG_VOLUME_5D = 30_000_000  # Также изменено на 30 млн руб
 LOOKBACK_TRADING_DAYS = 3
 VOLUME_DAYS = 5
 
 # Фиксированное время сканирования (МСК)
-SCAN_TIMES = ["12:20", "18:20"]
+SCAN_TIMES = ["19:30"]  # Изменено только на 19:30
 
 # ================= ТОРГОВЫЕ СЕССИИ =================
 class TradingSession:
